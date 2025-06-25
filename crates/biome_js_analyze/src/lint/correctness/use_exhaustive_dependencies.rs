@@ -22,7 +22,13 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
 
 use crate::JsRuleAction;
-use crate::react::hooks::*;
+// Specific imports from react::hooks
+use crate::react::hooks::{
+    StableHookResult, StableReactHookConfiguration, ReactHookConfiguration,
+    unwrap_to_call_expression, is_binding_react_stable, react_hook_with_dependency
+};
+// Direct imports from react
+use crate::react::{is_react_call_api, ReactLibrary};
 use crate::services::semantic::Semantic;
 
 #[cfg(feature = "schemars")]
@@ -490,6 +496,60 @@ fn capture_needs_to_be_in_the_dependency_list(
     options: &HookConfigMaps,
 ) -> bool {
     // Ignore if referenced in TS typeof
+    // Check if the capture is a member expression whose object is a hook returning stable keys
+    if let Ok(member_expr) = AnyJsMemberExpression::try_cast(capture.node().clone()) {
+        if let Some(object_ref) = member_expr.object().ok().and_then(|obj| obj.as_js_reference_identifier()) {
+            if let Some(binding) = model.binding(&object_ref) {
+                // Check if this binding comes from a variable declarator initialized by a hook call
+                if let Some(AnyJsBindingDeclaration::JsVariableDeclarator(declarator)) = binding.tree().declaration().map(|decl| decl.parent_binding_pattern_declaration().unwrap_or(decl)) {
+                    if let Some(initializer_call) = declarator.initializer().and_then(|init| init.expression().ok()).and_then(|expr| unwrap_to_call_expression(expr)) {
+                        let opt_callee_expr = initializer_call.callee().ok().map(|c| c.omit_parentheses());
+                        if let Some(callee_expr) = opt_callee_expr {
+                            let opt_hook_name_sv = if let Some(identifier) = callee_expr.as_js_reference_identifier() {
+                                identifier.value_token().ok().map(biome_js_syntax::static_value::StaticValue::String)
+                            } else if let Some(hook_member_expr) = AnyJsMemberExpression::cast_ref(callee_expr.syntax()) {
+                                hook_member_expr.member_name()
+                            } else {
+                                None
+                            };
+
+                            if let Some(hook_name_sv) = opt_hook_name_sv {
+                                let hook_name_str = hook_name_sv.text();
+                                for stable_conf in &options.stable_config {
+                                    if stable_conf.hook_name.as_ref() == hook_name_str {
+                                        let is_correct_hook = if stable_conf.builtin {
+                                            is_react_call_api(&callee_expr, model, ReactLibrary::React, hook_name_str)
+                                        } else {
+                                            true // For custom hooks, name match is sufficient if found in stable_config
+                                        };
+
+                                        if is_correct_hook {
+                                            if let StableHookResult::Keys(stable_keys) = &stable_conf.result {
+                                                if let Some(accessed_member_name_token) = member_expr.member_name() {
+                                                    if let Some(accessed_member_name_str) = accessed_member_name_token.as_string_constant() {
+                                                        // Convert to owned type to avoid lifetime issues if needed by iter().any()
+                                                        // However, for simple comparison, &str should be fine.
+                                                        // The issue E0515 was "cannot return value referencing function parameter `m`"
+                                                        // which means the &str from as_string_constant() was problematic if returned/stored.
+                                                        // Here, we are just comparing.
+                                                        if stable_keys.iter().any(|k| k.as_ref() == accessed_member_name_str) {
+                                                            return false; // Member access is stable, not needed in deps
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Ignore if referenced in TS typeof
     if capture
         .node()
         .ancestors()
@@ -877,7 +937,7 @@ impl Rule for UseExhaustiveDependencies {
             {
                 let mut dep_list: BTreeMap<String, AnyJsExpression> = BTreeMap::new();
                 for dep in correct_deps.iter() {
-                    let expression_name = dep.to_string();
+                    let expression_name = dep.syntax().text_trimmed().to_string();
                     if dep_list.contains_key(&expression_name) {
                         signals.push(Fix::RemoveDependency {
                             function_name_range: result.function_name_range,

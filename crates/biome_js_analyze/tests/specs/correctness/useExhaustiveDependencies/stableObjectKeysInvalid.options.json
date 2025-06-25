@@ -1,0 +1,20 @@
+{
+  "//": "options for stableObjectKeysInvalid.js",
+  "linter": {
+    "rules": {
+      "correctness": {
+        "useExhaustiveDependencies": {
+          "level": "error",
+          "options": {
+            "hooks": [
+              {
+                "name": "useMyBoolean",
+                "stableResult": { "keys": ["toggle", "setFalse"] }
+              }
+            ]
+          }
+        }
+      }
+    }
+  }
+}

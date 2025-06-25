@@ -14,7 +14,7 @@ use biome_js_syntax::{
     static_value::StaticValue,
 };
 use biome_js_syntax::{JsArrayBindingPatternElement, JsSyntaxToken};
-use biome_rowan::AstNode;
+use biome_rowan::{AstNode, Text}; // Added Text
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
 
@@ -262,6 +262,13 @@ pub enum StableHookResult {
     /// For example, React's `useState()` hook returns a stable function at
     /// index 1.
     Indices(Vec<u8>),
+
+    /// Used to indicate the hook returns an object and some of its keys correspond
+    /// to stable values.
+    ///
+    /// For example, a custom hook `useBoolean()` might return `{ value: boolean, toggle: () => void }`,
+    /// where `toggle` is stable.
+    Keys(Vec<Box<str>>),
 }
 
 #[cfg(feature = "schemars")]
@@ -278,7 +285,7 @@ impl JsonSchema for StableHookResult {
                     Schema::Object(SchemaObject {
                         instance_type: Some(InstanceType::Boolean.into()),
                         metadata: Some(Box::new(Metadata {
-                            description: Some("Whether the hook has a stable result.".to_owned()),
+                            description: Some("Whether the hook has a stable result (true for identity, false for none).".to_owned()),
                             ..Default::default()
                         })),
                         ..Default::default()
@@ -300,7 +307,35 @@ impl JsonSchema for StableHookResult {
                             ..Default::default()
                         })),
                         metadata: Some(Box::new(Metadata {
-                            description: Some("Used to indicate the hook returns an array and some of its indices have stable identities.".to_owned()),
+                            description: Some("Used to indicate the hook returns an array and some of its indices have stable identities (e.g., `[1]`).".to_owned()),
+                            ..Default::default()
+                        })),
+                        ..Default::default()
+                    }),
+                    // Schema for Keys(Vec<Box<str>>) - expecting an object like { "keys": ["key1", "key2"] }
+                    Schema::Object(SchemaObject {
+                        instance_type: Some(InstanceType::Object.into()),
+                        object: Some(Box::new(ObjectValidation {
+                            properties: [(
+                                "keys".to_string(),
+                                Schema::Object(SchemaObject {
+                                    instance_type: Some(InstanceType::Array.into()),
+                                    array: Some(Box::new(ArrayValidation {
+                                        items: Some(SingleOrVec::Single(Box::new(Schema::Object(SchemaObject {
+                                            instance_type: Some(InstanceType::String.into()),
+                                            ..Default::default()
+                                        })))),
+                                        min_items: Some(1),
+                                        ..Default::default()
+                                    })),
+                                    ..Default::default()
+                                }),
+                            )].into_iter().collect(),
+                            required: ["keys".to_string()].into_iter().collect(),
+                            ..Default::default()
+                        })),
+                        metadata: Some(Box::new(Metadata {
+                            description: Some("Used to indicate the hook returns an object and some of its keys have stable identities (e.g., `{ \"keys\": [\"toggle\"] }`).".to_owned()),
                             ..Default::default()
                         })),
                         ..Default::default()
@@ -323,13 +358,60 @@ impl biome_deserialize::Deserializable for StableHookResult {
     }
 }
 
+struct StringVisitor;
+impl DeserializationVisitor for StringVisitor {
+    type Output = Box<str>;
+    const EXPECTED_TYPE: DeserializableTypes = DeserializableTypes::STR;
+
+    fn visit_str(
+        self,
+        _ctx: &mut impl DeserializationContext,
+        value: Text, // Corrected type
+        _range: TextRange,
+        _name: &str,
+    ) -> Option<Self::Output> {
+        Some(value.to_string().into_boxed_str()) // Convert Text to String then to Box<str>
+    }
+}
+
+struct VecBoxStrVisitor;
+impl DeserializationVisitor for VecBoxStrVisitor {
+    type Output = Vec<Box<str>>;
+    const EXPECTED_TYPE: DeserializableTypes = DeserializableTypes::ARRAY;
+
+    fn visit_array(
+        self,
+        ctx: &mut impl DeserializationContext,
+        items: impl Iterator<Item = Option<impl DeserializableValue>>,
+        _range: TextRange,
+        _name: &str,
+    ) -> Option<Self::Output> {
+        let mut vec = Vec::new();
+        for item_value in items {
+            if let Some(item_deserialized) = item_value {
+                if let Some(val) = item_deserialized.deserialize(ctx, StringVisitor, "stable key name in array") {
+                    vec.push(val);
+                } else {
+                    // Error deserializing one of the elements as a string
+                    return None;
+                }
+            } else {
+                // Item itself is None, could be an error or just an empty slot if parser allows
+                return None;
+            }
+        }
+        Some(vec)
+    }
+}
+
 struct StableResultVisitor;
 impl DeserializationVisitor for StableResultVisitor {
     type Output = StableHookResult;
 
     const EXPECTED_TYPE: DeserializableTypes = DeserializableTypes::ARRAY
         .union(DeserializableTypes::BOOL)
-        .union(DeserializableTypes::NUMBER);
+        .union(DeserializableTypes::NUMBER)
+        .union(DeserializableTypes::MAP);
 
     fn visit_array(
         self,
@@ -349,6 +431,46 @@ impl DeserializationVisitor for StableResultVisitor {
         } else {
             StableHookResult::Indices(indices)
         })
+    }
+
+    fn visit_map(
+        self,
+        ctx: &mut impl DeserializationContext,
+        items: impl Iterator<Item = Option<(impl DeserializableValue, impl DeserializableValue)>>,
+        _map_range: TextRange,
+        _name: &str,
+    ) -> Option<Self::Output> {
+        for item_pair in items {
+            if let Some((key_node, value_node)) = item_pair {
+                let key_range = key_node.range();
+                // Deserialize the key as a Box<str>
+                if let Some(key_text) = key_node.deserialize(ctx, StringVisitor, "object key") {
+                    if key_text.as_ref() == "keys" {
+                        // The value associated with "keys" should be an array of strings
+                        return value_node.deserialize(ctx, VecBoxStrVisitor, "array of stable keys")
+                            .map(StableHookResult::Keys);
+                    } else {
+                        ctx.report(
+                            DeserializationDiagnostic::new_unknown_key(
+                                key_text.as_ref(),
+                                key_range,
+                                &["keys"],
+                            )
+                        );
+                    }
+                } else {
+                    // Key wasn't deserializable as a string. StringVisitor would have reported.
+                    // If StringVisitor doesn't report, or if we need to be more explicit:
+                    // ctx.report(DeserializationDiagnostic::new_incorrect_type_with_name(
+                    //     key_node.ty(),
+                    //     DeserializableTypes::STR,
+                    //     "object key",
+                    //     key_range
+                    // ));
+                }
+            }
+        }
+        None
     }
 
     fn visit_bool(
@@ -464,6 +586,10 @@ pub fn is_binding_react_stable(
         match (&config.result, index) {
             (StableHookResult::Identity, index) => index.is_none(),
             (StableHookResult::Indices(indices), Some(index)) => indices.contains(&index),
+            // The object itself returned by a hook configured with `Keys` is not considered stable for deps.
+            // Only member access to a specifically listed stable key is considered stable,
+            // which is handled in `capture_needs_to_be_in_the_dependency_list`.
+            (StableHookResult::Keys(_), _index) => false,
             (_, _) => false,
         }
     })
@@ -471,7 +597,7 @@ pub fn is_binding_react_stable(
 
 /// Unwrap the expression to a call expression without changing the result of the expression,
 /// such as type assertions.
-fn unwrap_to_call_expression(mut expression: AnyJsExpression) -> Option<JsCallExpression> {
+pub(crate) fn unwrap_to_call_expression(mut expression: AnyJsExpression) -> Option<JsCallExpression> {
     loop {
         match expression {
             AnyJsExpression::JsCallExpression(expr) => return Some(expr),

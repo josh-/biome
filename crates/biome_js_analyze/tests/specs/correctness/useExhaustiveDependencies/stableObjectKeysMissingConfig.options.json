@@ -1,0 +1,10 @@
+{
+  "//": "options for stableObjectKeysMissingConfig.js",
+  "linter": {
+    "rules": {
+      "correctness": {
+        "useExhaustiveDependencies": "error"
+      }
+    }
+  }
+}

@@ -4325,11 +4325,11 @@
 		"StableHookResult": {
 			"oneOf": [
 				{
-					"description": "Whether the hook has a stable result.",
+					"description": "Whether the hook has a stable result (true for identity, false for none).",
 					"type": "boolean"
 				},
 				{
-					"description": "Used to indicate the hook returns an array and some of its indices have stable identities.",
+					"description": "Used to indicate the hook returns an array and some of its indices have stable identities (e.g., `[1]`).",
 					"type": "array",
 					"items": {
 						"type": "integer",
@@ -4338,6 +4338,18 @@
 						"minimum": 0.0
 					},
 					"minItems": 1
+				},
+				{
+					"description": "Used to indicate the hook returns an object and some of its keys have stable identities (e.g., `{ \"keys\": [\"toggle\"] }`).",
+					"type": "object",
+					"required": ["keys"],
+					"properties": {
+						"keys": {
+							"type": "array",
+							"items": { "type": "string" },
+							"minItems": 1
+						}
+					}
 				}
 			]
 		},
